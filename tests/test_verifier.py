@@ -8,7 +8,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.verifier import verify_class  # noqa: E402
 from builder import (ACC_PUBLIC, ACC_STATIC, Asm, ClassBuilder,  # noqa: E402
-                     legal_construction_class, uninitialized_escape_class)
+                     illegal_switch_match_class,
+                     legal_construction_class, legal_sparse_switch_class,
+                     uninitialized_escape_class)
 
 DIAG = "com/acme/Diag"
 
@@ -433,6 +435,298 @@ class RejectionTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"]["kind"], "non-converging")
         self.assertIsInstance(res["error"]["offset"], int)
+
+
+class SwitchTests(unittest.TestCase):
+    """Sparse multiway branches (lookupswitch / tableswitch)."""
+
+    def test_illegal_match_target_rejected_at_first_stack_violation(self):
+        res = verify_class(illegal_switch_match_class())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stack-underflow")
+        # The violation is inside the matched target, not at the switch.
+        self.assertEqual(res["error"]["offset"], 36)
+        # Every switch target must have been analyzed (not left unreachable).
+        offsets = {s["offset"]: s for s in res["states"]}
+        for t in (36, 38, 39, 41):
+            self.assertIn(t, offsets)
+            self.assertTrue(offsets[t]["reachable"], f"target {t} unreachable")
+
+    def test_switch_with_empty_stack_rejected_at_switch_offset(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.lookupswitch("d", [(0, "t")])  # no selector pushed
+        a.label("t")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stack-underflow")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_legal_sparse_switch_passes_with_reviewable_target_states(self):
+        res = verify_class(legal_sparse_switch_class())
+        self.assertTrue(res["ok"], res.get("error"))
+        by = {s["offset"]: s for s in res["states"]}
+        # negative key -> legal return target
+        self.assertTrue(by[36]["reachable"])
+        self.assertEqual(by[36]["insn"], "return")
+        self.assertEqual(by[36]["stack"], [])
+        # small key -> int falls into the join
+        self.assertEqual(by[38]["stack"], ["int"])
+        # far-apart key -> construction path
+        self.assertEqual(by[41]["stack"], [])
+        self.assertEqual(by[44]["stack"],
+                         [f"uninit(new@41 {DIAG})"])
+        self.assertEqual(by[48]["stack"], [f"ref {DIAG}"])
+        # the join merges the goto edge and the construction fall-through
+        self.assertEqual(by[50]["locals"], ["top"])
+        self.assertEqual(by[50]["stack"], ["int"])
+
+    def test_switch_join_stack_height_conflict_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)              # iconst_0 selector
+        a.lookupswitch("dflt", [(1, "one"), (2, "two")])
+        a.label("one")
+        a.op(0x03)              # iconst_0 -> join carries one int
+        a.branch(0xA7, "j")
+        a.label("two")
+        a.branch(0xA7, "j")     # join carries empty stack
+        a.label("j")
+        a.op(0x57)
+        a.label("dflt")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stack-height-mismatch")
+
+    def test_switch_join_type_conflict_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("dflt", [(1, "one"), (2, "two")])
+        a.label("one")
+        a.op(0xBB).u2(b.cp.cls(DIAG))
+        a.branch(0xA7, "j")
+        a.label("two")
+        a.op(0x01)              # aconst_null
+        a.label("j")
+        a.op(0x4B)              # astore_0: uninit vs null -> conflict
+        a.label("dflt")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=1)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "incompatible-types")
+
+    def test_unordered_lookupswitch_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(2, "a"), (1, "a")])  # descending keys
+        a.label("a")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-lookupswitch")
+        self.assertEqual(res["error"]["offset"], 1)
+
+    def test_truncated_lookupswitch_table_rejected(self):
+        # Declare 3 pairs but cut the code so the last pair is missing.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(1, "a"), (2, "a"), (3, "a")])
+        a.label("a")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        code = a.build()
+        b.add_method("run", code[:-8], max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-instruction")
+        self.assertEqual(res["error"]["offset"], 1)
+
+    def test_switch_target_into_instruction_middle_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(1, "mid")])
+        a.op(0x11)              # sipush, 3 bytes
+        a.label("mid")         # -> middle of its immediate
+        a.u2(0x1234)
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+        self.assertEqual(res["error"]["offset"], 1)
+
+    def test_switch_default_target_into_middle_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("dmid", [(1, "a")])
+        a.op(0x11)
+        a.label("dmid")
+        a.u2(0x1234)
+        a.op(0xB1)
+        a.label("a")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+
+    def test_switch_alignment_when_starting_at_pc_2(self):
+        # bipush (2 bytes) puts the switch at pc 2: payload starts at 3,
+        # so one padding byte aligns the header to pc 4.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x10, 0x05)       # 0 bipush 5 (selector)
+        a.lookupswitch("d", [(-7, "t"), (999, "t")])
+        a.label("t")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        sw = next(s for s in res["states"] if s["insn"].startswith("lookupswitch"))
+        self.assertEqual(sw["offset"], 2)
+        # both keys and default land on return targets, all reachable
+        rets = [s for s in res["states"] if s["insn"] == "return"]
+        self.assertTrue(rets)
+        self.assertTrue(all(s["reachable"] for s in rets))
+        self.assertTrue(all(s["stack"] == [] for s in rets))
+
+    def test_tableswitch_legal(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.tableswitch(10, 12, "d", ["a", "b", "c"])
+        a.label("a")
+        a.op(0xB1)
+        a.label("b")
+        a.op(0xB1)
+        a.label("c")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+
+    def test_tableswitch_bad_range_rejected(self):
+        # Build a valid table then corrupt the header so high < low.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.tableswitch(1, 2, "d", ["x", "x"])
+        a.label("x")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        code = bytearray(a.build())
+        # switch starts at 1; padding to a 4-byte boundary puts the header at
+        # offset 4: default@4, low@8, high@12.  Set high below low.
+        code[12:16] = (0).to_bytes(4, "big", signed=True)
+        b.add_method("run", bytes(code), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-tableswitch")
+
+    def test_tableswitch_truncated_payload_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.tableswitch(1, 4, "d", ["x", "x", "x", "x"])
+        a.label("x")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        code = a.build()
+        b.add_method("run", code[:-4], max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-instruction")
+
+    def test_switch_dedups_shared_target_frame(self):
+        # Two matches sharing one target is one edge, not a conflicting join.
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(-9, "t"), (9, "t")])
+        a.label("t")
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+
+    def test_switch_with_construction_and_exception_table(self):
+        b, x, init = diag_builder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(1, "make")])
+        a.label("make")
+        a.op(0xBB).u2(x)
+        a.op(0x59)
+        a.op(0xB7).u2(init)
+        a.op(0x57)
+        a.op(0xB1)
+        a.label("h")
+        a.op(0x57)
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        raw = a.build()
+        hpc = a.labels["h"]
+        b.add_method("run", raw, max_stack=2, max_locals=1,
+                     exceptions=[(0, hpc, hpc, 0)])
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        h = res["handlers"][0]
+        self.assertTrue(h["reachable"])
+        self.assertEqual(h["stack"], ["ref java/lang/Throwable"])
+
+    def test_switch_construction_target_halfinit_blocked_from_handler(self):
+        b, x, init = diag_builder()
+        a = Asm()
+        a.op(0x03)
+        a.lookupswitch("d", [(1, "make")])
+        a.label("make")
+        a.op(0xBB).u2(x)       # new
+        a.op(0x4B)             # astore_0 (uninitialized into a local)
+        a.label("nop")
+        a.op(0x00)             # nop covered by the handler range
+        a.op(0x2A)
+        a.op(0xB7).u2(init)
+        a.op(0xB1)
+        a.label("h")
+        a.op(0x57)
+        a.op(0xB1)
+        a.label("d")
+        a.op(0xB1)
+        raw = a.build()
+        b.add_method("run", raw, max_stack=2, max_locals=1,
+                     exceptions=[(0, a.labels["h"], a.labels["h"], 0)])
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"],
+                         "uninitialized-escapes-to-handler")
+        self.assertEqual(res["error"]["offset"], a.labels["nop"])
 
 
 class MethodSelectionTests(unittest.TestCase):

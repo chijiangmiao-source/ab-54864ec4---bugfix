@@ -174,6 +174,108 @@ _SIZES = {"b": 2, "u1": 2, "s2": 3, "cp1": 2, "cp2": 3, "iinc": 3,
           "br2": 3, "br4": 5}
 
 
+def _switch_padding(off: int) -> int:
+    """lookupswitch/tableswitch pad so the first int32 operand is aligned
+    to a 4-byte boundary *relative to the start of the method's code*."""
+    payload = off + 1
+    return (4 - (payload % 4)) % 4
+
+
+def _s32(code: bytes, pos: int) -> int:
+    return int.from_bytes(code[pos:pos + 4], "big", signed=True)
+
+
+def _decode_switch(code: bytes, off: int, n: int, op: int) -> Insn:
+    """Decode a tableswitch (0xAA) or lookupswitch (0xAB) instruction.
+
+    Targets are stored as absolute code offsets; whether they land on
+    instruction boundaries is checked after the full linear sweep, when
+    every instruction offset is known.
+    """
+    name = "lookupswitch" if op == 0xAB else "tableswitch"
+    padding = _switch_padding(off)
+    header = off + 1 + padding
+    if op == 0xAB:
+        if header + 8 > n:
+            raise VerifyError(
+                off, "truncated-instruction",
+                f"lookupswitch at offset {off} has an incomplete header")
+        default = _s32(code, header)
+        npairs = _s32(code, header + 4)
+        if npairs < 0:
+            raise VerifyError(
+                off, "bad-lookupswitch",
+                f"lookupswitch at offset {off} declares a negative npairs "
+                f"{npairs}")
+        size = 1 + padding + 8 + npairs * 8
+        if npairs > n or off + size > n:
+            raise VerifyError(
+                off, "truncated-instruction",
+                f"lookupswitch at offset {off} declares {npairs} pair(s) but "
+                f"its payload is truncated")
+        pairs = []
+        prev = None
+        p = header + 8
+        for _ in range(npairs):
+            match = _s32(code, p)
+            if prev is not None and match <= prev:
+                raise VerifyError(
+                    off, "bad-lookupswitch",
+                    f"lookupswitch at offset {off} has match values out of "
+                    f"strictly ascending order: {prev} followed by {match}")
+            prev = match
+            pairs.append((match, off + _s32(code, p + 4)))
+            p += 8
+        return Insn(off, op, name,
+                    (off + default, npairs, tuple(pairs)), size)
+
+    if header + 12 > n:
+        raise VerifyError(
+            off, "truncated-instruction",
+            f"tableswitch at offset {off} has an incomplete header")
+    default = _s32(code, header)
+    low = _s32(code, header + 4)
+    high = _s32(code, header + 8)
+    if high < low:
+        raise VerifyError(
+            off, "bad-tableswitch",
+            f"tableswitch at offset {off} has high ({high}) < low ({low})")
+    count = high - low + 1
+    size = 1 + padding + 12 + 4 * count
+    if count > n or off + size > n:
+        raise VerifyError(
+            off, "truncated-instruction",
+            f"tableswitch at offset {off} declares {count} offset(s) "
+            f"({low}..{high}) but its payload is truncated")
+    targets = tuple(off + _s32(code, header + 12 + 4 * i)
+                    for i in range(count))
+    return Insn(off, op, name,
+                (off + default, low, high, targets), size)
+
+
+def _validate_switch_targets(insns: dict) -> None:
+    """Every switch target (default and each case offset) must point at the
+    first byte of an instruction -- structurally, even when the switch
+    itself is unreachable."""
+    for ins in insns.values():
+        if ins.name == "lookupswitch":
+            default, _npairs, pairs = ins.operands
+            checked = [(None, default)] + list(pairs)
+        elif ins.name == "tableswitch":
+            default, low, _high, offsets = ins.operands
+            checked = [(None, default)]
+            checked += list(enumerate(offsets, start=low))
+        else:
+            continue
+        for match, t in checked:
+            if t not in insns:
+                which = "default" if match is None else f"match {match}"
+                raise VerifyError(
+                    ins.offset, "bad-branch-target",
+                    f"{ins.name} at offset {ins.offset} sends {which} to "
+                    f"offset {t}, which is not the start of an instruction")
+
+
 def decode(code: bytes) -> dict:
     """Linear-sweep decode; every offset in `code` is covered exactly once."""
     insns = {}
@@ -185,32 +287,10 @@ def decode(code: bytes) -> dict:
             insns[off] = Insn(off, op, _SIMPLE[op], (), 1)
             off += 1
             continue
-        if op == 0xAB:
-            payload = off + 1
-            padding = (4 - (payload % 4)) % 4
-            header = payload + padding
-            if header + 8 > n:
-                raise VerifyError(
-                    off, "truncated-instruction",
-                    f"lookupswitch at offset {off} has an incomplete header")
-            default = int.from_bytes(code[header:header + 4], "big",
-                                     signed=True)
-            npairs = int.from_bytes(code[header + 4:header + 8], "big",
-                                    signed=True)
-            if npairs < 0:
-                raise VerifyError(
-                    off, "bad-lookupswitch",
-                    f"lookupswitch at offset {off} declares negative npairs "
-                    f"{npairs}")
-            size = 1 + padding + 8 + npairs * 8
-            if off + size > n:
-                raise VerifyError(
-                    off, "truncated-instruction",
-                    f"lookupswitch at offset {off} declares {npairs} pair(s) "
-                    f"but its payload is truncated")
-            insns[off] = Insn(off, op, "lookupswitch", (default, npairs),
-                              size)
-            off += size
+        if op in (0xAA, 0xAB):
+            insn = _decode_switch(code, off, n, op)
+            insns[off] = insn
+            off += insn.size
             continue
         spec = _FORMATS.get(op)
         if spec is None:
@@ -243,6 +323,7 @@ def decode(code: bytes) -> dict:
                                        signed=True))
         insns[off] = Insn(off, op, name, operands, size)
         off += size
+    _validate_switch_targets(insns)
     return insns
 
 
@@ -353,8 +434,14 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
     n = insn.name
     try:
         if n == "lookupswitch":
-            return (f"lookupswitch default {insn.offset + insn.operands[0]} "
-                    f"({insn.operands[1]} case(s))")
+            default, npairs, pairs = insn.operands
+            keys = ", ".join(str(m) for m, _ in pairs)
+            return (f"lookupswitch default {default} "
+                    f"({npairs} case(s): {keys})")
+        if n == "tableswitch":
+            default, low, high, offsets = insn.operands
+            return (f"tableswitch {low}..{high} default {default} "
+                    f"({len(offsets)} offset(s))")
         if n.startswith("if") or n in ("goto", "goto_w"):
             return f"{n} {insn.offset + insn.operands[0]}"
         if n in ("bipush", "sipush"):
@@ -655,9 +742,19 @@ class MethodVerifier:
             return via_branch()
         if n in ("goto", "goto_w"):
             return [(branch_target(), out())]
-        if n == "lookupswitch":
+        if n in ("lookupswitch", "tableswitch"):
+            # The selector is consumed; every possible value (default plus
+            # each declared case) continues with the same outgoing frame,
+            # so each target is a real edge whose state must verify.
             pop_int()
-            return [(branch_target(), out())]
+            f = out()
+            if n == "lookupswitch":
+                default, _npairs, pairs = insn.operands
+                targets = [default] + [t for _m, t in pairs]
+            else:
+                default, _low, _high, offsets = insn.operands
+                targets = [default, *offsets]
+            return [(t, f) for t in dict.fromkeys(targets)]
 
         # -- object creation / initialization
         if n == "new":

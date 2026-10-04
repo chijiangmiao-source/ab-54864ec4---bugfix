@@ -110,6 +110,45 @@ class Asm:
         self.buf += b"\x00" * width
         return self
 
+    def lookupswitch(self, default_label, cases):
+        """Emit lookupswitch (0xAB) with 4-byte-aligned int32 operands.
+
+        `cases` is an iterable of (match, label); pairs are emitted in the
+        order given -- the JVM requires strictly ascending match values, so
+        legal classes pass sorted input and malformed-class tests can pass
+        unsorted input deliberately.
+        """
+        insn = len(self.buf)
+        self.buf.append(0xAB)
+        pad = (4 - ((insn + 1) % 4)) % 4
+        self.buf += b"\x00" * pad
+        self.fixups.append((len(self.buf), insn, default_label, 4))
+        self.buf += b"\x00" * 4  # default offset
+        cases = list(cases)
+        self.buf += len(cases).to_bytes(4, "big", signed=True)
+        for match, label in cases:
+            self.buf += match.to_bytes(4, "big", signed=True)
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        return self
+
+    def tableswitch(self, low, high, default_label, labels):
+        """Emit tableswitch (0xAA); `labels` has high-low+1 entries."""
+        insn = len(self.buf)
+        self.buf.append(0xAA)
+        pad = (4 - ((insn + 1) % 4)) % 4
+        self.buf += b"\x00" * pad
+        self.fixups.append((len(self.buf), insn, default_label, 4))
+        self.buf += b"\x00" * 4  # default offset
+        self.buf += low.to_bytes(4, "big", signed=True)
+        self.buf += high.to_bytes(4, "big", signed=True)
+        labels = list(labels)
+        assert len(labels) == high - low + 1
+        for label in labels:
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        return self
+
     def build(self):
         for pos, insn, label, width in self.fixups:
             off = self.labels[label] - insn
@@ -215,4 +254,66 @@ def uninitialized_escape_class():
     a.op(0xB1)             # 11 return
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
+    return b.build()
+
+
+def illegal_switch_match_class():
+    """Structurally legal, aligned, sparse lookupswitch -- but the target of
+    match -1 executes a value-consuming instruction with an empty stack
+    (iadd).  The default target returns.  The class must be rejected at the
+    target offset with stack-underflow; before the fix the verifier only
+    analyzed the default edge, so the match target stayed "unreachable" and
+    the class was wrongly passed."""
+    b = ClassBuilder("SparseBad")
+    a = Asm()
+    a.op(0x03)              # 0 iconst_0       (push the selector)
+    a.lookupswitch("dflt", [
+        (-1, "bad"),        #   -> empty-stack iadd
+        (7, "ok_ret"),      #   -> legal return
+        (2000000000, "ok_join"),
+    ])
+    a.label("bad")
+    a.op(0x60)              # iadd  <- underflow, first stack violation
+    a.op(0xB1)              # return
+    a.label("ok_ret")
+    a.op(0xB1)              # return
+    a.label("ok_join")
+    a.op(0x03)              # iconst_0
+    a.op(0x3B)              # istore_0
+    a.label("dflt")
+    a.op(0xB1)              # return
+    b.add_method("run", a.build(), max_stack=1, max_locals=1)
+    return b.build()
+
+
+def legal_sparse_switch_class():
+    """A passing class: one sparse lookupswitch with a negative key, a small
+    key and a far-apart positive key, fanning into legal-return / local
+    merge / object-construction paths; default returns directly."""
+    b = ClassBuilder("SparseOk")
+    x = b.cp.cls("com/acme/Diag")
+    init = b.cp.methodref("com/acme/Diag", "<init>", "()V")
+    a = Asm()
+    a.op(0x03)              # 0 iconst_0      (push the selector)
+    a.lookupswitch("dflt", [
+        (-42, "ret"),       #   -> legal return
+        (5, "merge"),       #   -> int/local join
+        (1000000, "make"),  #   -> object construction
+    ])
+    a.label("ret")          # 24
+    a.op(0xB1)              # 24 return
+    a.label("merge")        # 25
+    a.op(0x03)              # 25 iconst_0
+    a.branch(0xA7, "join")  # 26 goto join
+    a.label("make")         # 29
+    a.op(0xBB).u2(x)        # 29 new
+    a.op(0x59)              # 32 dup
+    a.op(0xB7).u2(init)     # 33 invokespecial <init>
+    a.op(0x57)              # 36 pop
+    a.op(0x03)              # 37 iconst_0
+    a.label("join")         # 38
+    a.op(0x3B)              # 38 istore_0
+    a.label("dflt")         # 39
+    a.op(0xB1)              # 39 return
+    b.add_method("run", a.build(), max_stack=2, max_locals=1)
     return b.build()
