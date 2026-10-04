@@ -185,31 +185,82 @@ def decode(code: bytes) -> dict:
             insns[off] = Insn(off, op, _SIMPLE[op], (), 1)
             off += 1
             continue
-        if op == 0xAB:
+        if op in (0xAA, 0xAB):
+            name = "tableswitch" if op == 0xAA else "lookupswitch"
             payload = off + 1
             padding = (4 - (payload % 4)) % 4
             header = payload + padding
-            if header + 8 > n:
-                raise VerifyError(
-                    off, "truncated-instruction",
-                    f"lookupswitch at offset {off} has an incomplete header")
-            default = int.from_bytes(code[header:header + 4], "big",
+            if op == 0xAB:
+                if header + 8 > n:
+                    raise VerifyError(
+                        off, "truncated-instruction",
+                        f"lookupswitch at offset {off} has an incomplete header")
+                default = int.from_bytes(code[header:header + 4], "big",
+                                         signed=True)
+                npairs = int.from_bytes(code[header + 4:header + 8], "big",
+                                        signed=True)
+                if npairs < 0:
+                    raise VerifyError(
+                        off, "bad-lookupswitch",
+                        f"lookupswitch at offset {off} declares negative "
+                        f"npairs {npairs}")
+                size = 1 + padding + 8 + npairs * 8
+                if off + size > n:
+                    raise VerifyError(
+                        off, "truncated-instruction",
+                        f"lookupswitch at offset {off} declares {npairs} "
+                        f"pair(s) but its payload is truncated")
+                pairs = []
+                last_key = None
+                for i in range(npairs):
+                    q = header + 8 + i * 8
+                    key = int.from_bytes(code[q:q + 4], "big", signed=True)
+                    rel = int.from_bytes(code[q + 4:q + 8], "big", signed=True)
+                    # JVMS lookupswitch: match values must be distinct and
+                    # sorted strictly ascending so the lookup is unambiguous.
+                    if last_key is not None and key <= last_key:
+                        raise VerifyError(
+                            off, "bad-lookupswitch",
+                            f"lookupswitch at offset {off} has out-of-order "
+                            f"match values: pair {i} key {key} must be "
+                            f"strictly greater than {last_key}")
+                    last_key = key
+                    pairs.append((key, rel))
+                insns[off] = Insn(
+                    off, op, "lookupswitch",
+                    (default, npairs, tuple(pairs)), size)
+            else:
+                if header + 12 > n:
+                    raise VerifyError(
+                        off, "truncated-instruction",
+                        f"tableswitch at offset {off} has an incomplete header")
+                default = int.from_bytes(code[header:header + 4], "big",
+                                         signed=True)
+                low = int.from_bytes(code[header + 4:header + 8], "big",
                                      signed=True)
-            npairs = int.from_bytes(code[header + 4:header + 8], "big",
-                                    signed=True)
-            if npairs < 0:
-                raise VerifyError(
-                    off, "bad-lookupswitch",
-                    f"lookupswitch at offset {off} declares negative npairs "
-                    f"{npairs}")
-            size = 1 + padding + 8 + npairs * 8
-            if off + size > n:
-                raise VerifyError(
-                    off, "truncated-instruction",
-                    f"lookupswitch at offset {off} declares {npairs} pair(s) "
-                    f"but its payload is truncated")
-            insns[off] = Insn(off, op, "lookupswitch", (default, npairs),
-                              size)
+                high = int.from_bytes(code[header + 8:header + 12], "big",
+                                      signed=True)
+                if low > high:
+                    raise VerifyError(
+                        off, "bad-tableswitch",
+                        f"tableswitch at offset {off} has low={low} greater "
+                        f"than high={high}")
+                noffsets = high - low + 1
+                size = 1 + padding + 12 + noffsets * 4
+                if off + size > n:
+                    raise VerifyError(
+                        off, "truncated-instruction",
+                        f"tableswitch at offset {off} declares {noffsets} "
+                        f"offset(s) for [{low}..{high}] but its payload is "
+                        f"truncated")
+                offsets = tuple(
+                    int.from_bytes(
+                        code[header + 12 + i * 4:header + 16 + i * 4],
+                        "big", signed=True)
+                    for i in range(noffsets))
+                insns[off] = Insn(
+                    off, op, "tableswitch",
+                    (default, low, high, offsets), size)
             off += size
             continue
         spec = _FORMATS.get(op)
@@ -353,8 +404,14 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
     n = insn.name
     try:
         if n == "lookupswitch":
-            return (f"lookupswitch default {insn.offset + insn.operands[0]} "
-                    f"({insn.operands[1]} case(s))")
+            default, npairs, pairs = insn.operands
+            keys = ", ".join(str(k) for k, _ in pairs)
+            return (f"lookupswitch default {insn.offset + default} "
+                    f"({npairs} case(s): {keys})")
+        if n == "tableswitch":
+            default, low, high, offsets = insn.operands
+            return (f"tableswitch default {insn.offset + default} "
+                    f"({low}..{high})")
         if n.startswith("if") or n in ("goto", "goto_w"):
             return f"{n} {insn.offset + insn.operands[0]}"
         if n in ("bipush", "sipush"):
@@ -655,9 +712,27 @@ class MethodVerifier:
             return via_branch()
         if n in ("goto", "goto_w"):
             return [(branch_target(), out())]
-        if n == "lookupswitch":
+        if n in ("lookupswitch", "tableswitch"):
             pop_int()
-            return [(branch_target(), out())]
+            if n == "lookupswitch":
+                default, _npairs, pairs = insn.operands
+                rels = (default, *(rel for _key, rel in pairs))
+            else:
+                default, _low, _high, offsets = insn.operands
+                rels = (default, *offsets)
+            f = out()
+            targets = []
+            seen = set()
+            for rel in rels:
+                t = pc + rel
+                if t not in self.insns:
+                    err("bad-branch-target",
+                        f"{n} targets offset {t}, which is not the start of "
+                        f"an instruction")
+                if t not in seen:  # several keys may share one target block
+                    seen.add(t)
+                    targets.append(t)
+            return [(t, f) for t in targets]
 
         # -- object creation / initialization
         if n == "new":

@@ -110,6 +110,43 @@ class Asm:
         self.buf += b"\x00" * width
         return self
 
+    def lookupswitch(self, default, cases):
+        """Emit lookupswitch. `cases` is a list of (signed key, label) in
+        strictly ascending key order; `default` is the default label.
+
+        Padding to the 4-byte boundary (relative to the method start) is
+        emitted automatically; all offsets are resolved as label fixups.
+        """
+        insn = len(self.buf)
+        self.buf.append(0xAB)
+        pad = (4 - (len(self.buf) % 4)) % 4
+        self.buf += b"\x00" * pad
+        default_pos = len(self.buf)
+        self.buf += b"\x00" * 4                    # default offset
+        self.buf += struct.pack(">i", len(cases))  # npairs
+        for key, label in cases:
+            self.buf += struct.pack(">i", key)
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        self.fixups.append((default_pos, insn, default, 4))
+        return self
+
+    def tableswitch(self, default, low, labels):
+        """Emit tableswitch covering values low .. low+len(labels)-1."""
+        insn = len(self.buf)
+        self.buf.append(0xAA)
+        pad = (4 - (len(self.buf) % 4)) % 4
+        self.buf += b"\x00" * pad
+        default_pos = len(self.buf)
+        high = low + len(labels) - 1
+        self.buf += b"\x00" * 4
+        self.buf += struct.pack(">ii", low, high)
+        for label in labels:
+            self.fixups.append((len(self.buf), insn, label, 4))
+            self.buf += b"\x00" * 4
+        self.fixups.append((default_pos, insn, default, 4))
+        return self
+
     def build(self):
         for pos, insn, label, width in self.fixups:
             off = self.labels[label] - insn
@@ -216,3 +253,229 @@ def uninitialized_escape_class():
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
     return b.build()
+
+
+# ---------------------------------------------------------------------------
+# Sparse multi-way branch (lookupswitch / tableswitch) fixtures
+#
+# The switch fixtures return (class_bytes, marks); marks maps label names to
+# code offsets so tests can assert against stable, reviewable positions.
+# ---------------------------------------------------------------------------
+
+DIAG_NAME = "com/acme/Diag"
+
+
+def illegal_lookupswitch_case_class():
+    """Rejected: the default target simply returns, but the target of a
+    matched key continues at `iadd` with an empty operand stack. The class is
+    structurally legal (alignment, length, sorted keys, valid boundaries)."""
+    b = ClassBuilder("BadSwitch")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1 (switch key)
+    a.lookupswitch("d", [(1, "bad")])
+    a.label("d")
+    a.op(0xB1)                       # default: return
+    a.label("bad")
+    a.op(0x60)                       # matched case: iadd underflows
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=2, max_locals=0)
+    return b.build(), dict(a.labels)
+
+
+def sparse_lookupswitch_class():
+    """Passing: sparse keys (a negative far value, -7, 42 and a positive far
+    value) fan out to a plain return, two int/local join paths and an object
+    construction block guarded by its own exception handler."""
+    b = ClassBuilder("Sparse")
+    x = b.cp.cls(DIAG_NAME)
+    init = b.cp.methodref(DIAG_NAME, "<init>", "()V")
+    a = Asm()
+    a.op(0x10, 0x01)                 # 0 bipush 1
+    a.lookupswitch("d", [
+        (-2147483648, "ret_neg"),
+        (-7, "int_a"),
+        (42, "construct"),
+        (2147483647, "int_b"),
+    ])
+    a.label("ret_neg")
+    a.op(0xB1)                       # legal return path
+    a.label("int_a")
+    a.op(0x08)                       # iconst_5
+    a.op(0x3B)                       # istore_0
+    a.branch(0xA7, "join")
+    a.label("construct")
+    a.op(0xBB).u2(x)
+    a.op(0x59)                       # dup
+    a.op(0xB7).u2(init)
+    a.op(0x57)
+    a.op(0xB1)
+    a.label("h")                     # handler of the construction range only
+    a.op(0x57)
+    a.op(0xB1)
+    a.label("int_b")
+    a.op(0x02)                       # iconst_m1
+    a.op(0x3B)                       # istore_0
+    a.branch(0xA7, "join")
+    a.label("d")
+    a.op(0xB1)                       # default: return
+    a.label("join")
+    a.op(0x1A)                       # iload_0 (int from both join paths)
+    a.op(0x57)
+    a.op(0xB1)
+    code = a.build()
+    b.add_method("run", code, max_stack=2, max_locals=1,
+                 exceptions=[(a.labels["construct"], a.labels["h"],
+                              a.labels["h"], 0)])
+    return b.build(), dict(a.labels)
+
+
+def switch_join_conflict_class():
+    """Rejected: two matched targets converge at `join` with different
+    operand-stack heights."""
+    b = ClassBuilder("SwitchConflict")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.lookupswitch("d", [(1, "a"), (2, "b")])
+    a.label("a")
+    a.op(0x03)                       # iconst_0 (one value left on the stack)
+    a.branch(0xA7, "join")
+    a.label("b")
+    a.branch(0xA7, "join")           # empty stack
+    a.label("d")
+    a.op(0xB1)
+    a.label("join")
+    a.op(0x57)
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=0)
+    return b.build(), dict(a.labels)
+
+
+def switch_target_middle_class():
+    """Rejected: a matched offset lands in the middle of a sipush immediate."""
+    b = ClassBuilder("SwitchMid")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.lookupswitch("d", [(1, "mid")])
+    a.label("d")
+    a.op(0xB1)
+    a.op(0x11)                       # sipush
+    a.label("mid")
+    a.u2(0x1234)                     # <- case target points here
+    a.op(0x57)
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=0)
+    return b.build(), dict(a.labels)
+
+
+def unordered_lookupswitch_class():
+    """Rejected while decoding: match keys are not strictly ascending."""
+    b = ClassBuilder("SwitchUnordered")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.lookupswitch("d", [(1, "d"), (0, "d")])
+    a.label("d")
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=0)
+    return b.build()
+
+
+def duplicate_lookupswitch_key_class():
+    """Rejected while decoding: two pairs carry the same match value."""
+    b = ClassBuilder("SwitchDup")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.lookupswitch("d", [(1, "d"), (1, "d")])
+    a.label("d")
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=0)
+    return b.build()
+
+
+def truncated_lookupswitch_class():
+    """Rejected while decoding: npairs reaches past the code array."""
+    b = ClassBuilder("SwitchTrunc")
+    body = bytearray([0x04])                    # 0 iconst_1
+    body += bytes([0xAB, 0x00, 0x00])           # switch at 1 + 2 pad bytes
+    body += struct.pack(">ii", 20, 2)           # default, npairs = 2
+    body += struct.pack(">ii", 1, 20)           # only one pair actually present
+    b.add_method("run", bytes(body), max_stack=2, max_locals=0)
+    return b.build()
+
+
+def truncated_tableswitch_class():
+    """Rejected while decoding: [low..high] offsets reach past the code."""
+    b = ClassBuilder("TableTrunc")
+    body = bytearray([0x04])                    # 0 iconst_1
+    body += bytes([0xAA, 0x00, 0x00])           # tableswitch at 1 + pad
+    body += struct.pack(">iii", 20, 0, 9)       # default, low=0, high=9
+    body += struct.pack(">i", 20)               # one of ten offsets present
+    b.add_method("run", bytes(body), max_stack=1, max_locals=0)
+    return b.build()
+
+
+def tableswitch_low_gt_high_class():
+    """Rejected while decoding: low > high."""
+    b = ClassBuilder("TableBad")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.tableswitch("d", 5, [])        # high = 4 < low = 5
+    a.label("d")
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=0)
+    return b.build()
+
+
+def legal_tableswitch_class():
+    """Passing: tableswitch over -1..1, two int join paths plus a return."""
+    b = ClassBuilder("TableOk")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.tableswitch("d", -1, ["m1", "z", "p1"])
+    a.label("m1")
+    a.op(0x08)                       # iconst_5
+    a.op(0x3B)                       # istore_0
+    a.branch(0xA7, "join")
+    a.label("z")
+    a.op(0xB1)
+    a.label("p1")
+    a.op(0x02)                       # iconst_m1
+    a.op(0x3B)                       # istore_0
+    a.branch(0xA7, "join")
+    a.label("d")
+    a.op(0xB1)
+    a.label("join")
+    a.op(0x1A)                       # iload_0
+    a.op(0x57)
+    a.op(0xB1)
+    b.add_method("run", a.build(), max_stack=1, max_locals=1)
+    return b.build(), dict(a.labels)
+
+
+def switch_uninit_escape_class():
+    """Rejected: a switch case builds an object, stores the half-initialized
+    reference in local 0, and an exception range covering that block would
+    carry it into the handler."""
+    b = ClassBuilder("SwitchUninit")
+    x = b.cp.cls(DIAG_NAME)
+    init = b.cp.methodref(DIAG_NAME, "<init>", "()V")
+    a = Asm()
+    a.op(0x04)                       # 0 iconst_1
+    a.lookupswitch("d", [(1, "mk")])
+    a.label("mk")
+    a.op(0xBB).u2(x)
+    a.op(0x4B)                       # astore_0 (uninitialized)
+    a.label("leak")
+    a.op(0x00)                       # nop <- first edge carrying uninit
+    a.op(0x2A)
+    a.op(0xB7).u2(init)
+    a.op(0xB1)
+    a.label("h")
+    a.op(0x57)
+    a.op(0xB1)
+    a.label("d")
+    a.op(0xB1)
+    code = a.build()
+    b.add_method("run", code, max_stack=2, max_locals=1,
+                 exceptions=[(a.labels["mk"], a.labels["d"],
+                              a.labels["h"], 0)])
+    return b.build(), dict(a.labels)
